@@ -547,7 +547,7 @@ class LocalWalSyncImpl implements LocalWalSync {
 
     listener.onWalUpdated();
     try {
-      var partialRes = await syncLocalFiles([walFile]);
+      var partialRes = await _syncLocalFilesWithRetry([walFile]);
 
       resp.newConversationIds
           .addAll(partialRes.newConversationIds.where((id) => !resp.newConversationIds.contains(id)));
