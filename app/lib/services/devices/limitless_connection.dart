@@ -316,17 +316,35 @@ class LimitlessDeviceConnection extends DeviceConnection {
         // The data is physically present (~3750-4019 bytes) but the protobuf structure
         // may be unparseable due to misaligned metadata from clock drift. This scanner
         // looks for valid Opus frames by their TOC byte signature regardless of structure.
+        //
+        // Sanity check: A valid flash page should contain ~4-8 Opus frames. If the
+        // brute-force scanner finds fewer than 3 frames from a page with substantial
+        // data, the matches are likely false positives from random byte patterns
+        // (probability ~0.17% per byte position). We discard low-count results to
+        // avoid feeding garbage audio into the pipeline.
         if (opusFrames.isEmpty) {
-          opusFrames = _bruteForceExtractOpusFrames(flashPageData);
-          if (opusFrames.isNotEmpty) {
+          final bruteForceFrames = _bruteForceExtractOpusFrames(flashPageData);
+          if (bruteForceFrames.length >= 3) {
+            opusFrames = bruteForceFrames;
             parserUsed = 'fallback_brute_force';
+          } else if (bruteForceFrames.isNotEmpty) {
+            // Too few frames — likely false positives from corrupted data.
+            // Log but don't use these frames.
+            DebugLogManager.logWarning('Limitless brute-force scanner rejected (likely false positives)', {
+              'index': index,
+              'session': session,
+              'frameCount': bruteForceFrames.length,
+              'flashPageDataSize': flashPageData.length,
+            });
           }
         }
 
         // Fallback 3: Try recursive protobuf extraction from the entire page data.
         if (opusFrames.isEmpty) {
-          _extractOpusRecursive(flashPageData, 0, flashPageData.length, opusFrames);
-          if (opusFrames.isNotEmpty) {
+          final recursiveFrames = <List<int>>[];
+          _extractOpusRecursive(flashPageData, 0, flashPageData.length, recursiveFrames);
+          if (recursiveFrames.length >= 3) {
+            opusFrames = recursiveFrames;
             parserUsed = 'fallback_recursive';
           }
         }
