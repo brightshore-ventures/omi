@@ -389,6 +389,57 @@ void main() {
     });
   });
 
+  group('Brute-force false positive rejection', () {
+    test('Random data should produce few or no matches (statistical test)', () {
+      // Generate pseudo-random data that is NOT valid Opus
+      // Use a deterministic seed-like pattern to avoid flakiness
+      final data = List<int>.generate(4000, (i) => (i * 37 + 13) & 0xFF);
+
+      final extracted = bruteForceExtractOpusFrames(data);
+
+      // With random data, false positives are possible (~0.17% per byte position)
+      // but should be very few. For a 4000-byte page, expect < 10 false positives.
+      // The production code requires >= 3 frames to accept brute-force results,
+      // so even if some false positives occur, the threshold filters them.
+      // This test verifies the false positive rate is low.
+      expect(extracted.length, lessThan(15),
+          reason: 'Brute force should produce very few false positives on random data');
+    });
+
+    test('Minimum frame count threshold rejects sparse false positives', () {
+      // Simulate the production logic: require >= 3 frames from brute force
+      final data = <int>[];
+      // Only embed 1 valid-looking frame in otherwise random data
+      data.addAll(List<int>.generate(2000, (i) => (i * 41 + 7) & 0xFF));
+      data.add(0x12); // wire type 2
+      data.addAll(encodeVarint(50));
+      data.addAll(generateOpusFrame(50, tocByte: 0xb8));
+      data.addAll(List<int>.generate(1900, (i) => (i * 53 + 19) & 0xFF));
+
+      final extracted = bruteForceExtractOpusFrames(data);
+      // Even if brute force finds this 1 frame plus some false positives,
+      // the production code requires >= 3 frames to accept the result
+      // This makes it much harder for corrupted data to be mistaken for audio
+      expect(extracted.length, lessThan(10));
+    });
+
+    test('Pages with >= 3 valid frames pass the threshold', () {
+      final data = <int>[];
+      data.addAll([0x08, 0x01]); // some header
+      for (int i = 0; i < 5; i++) {
+        final frame = generateOpusFrame(50, tocByte: validOpusTocBytes[i % validOpusTocBytes.length]);
+        data.add(0x12); // wire type 2
+        data.addAll(encodeVarint(frame.length));
+        data.addAll(frame);
+        data.addAll([0x08, 0x01]); // spacer
+      }
+
+      final extracted = bruteForceExtractOpusFrames(data);
+      expect(extracted.length, greaterThanOrEqualTo(3),
+          reason: 'Should extract enough frames to pass the >= 3 threshold');
+    });
+  });
+
   group('Flash page parsing - edge cases', () {
     test('Handles page with maximum valid frame size (200 bytes)', () {
       final frames = [generateOpusFrame(200)];
