@@ -32,9 +32,11 @@ class LimitlessDeviceConnection extends DeviceConnection {
   int _highestReceivedIndex = -1;
   int _lastAcknowledgedIndex = -1;
 
-  /// Clock drift detected during initialization (device time - host time, in ms).
-  /// Positive means device clock is ahead; negative means behind.
-  int _clockDriftMs = 0;
+  /// Pre-sync storage state captured before clock correction.
+  /// The Limitless pendant has no readable RTC, so we cannot measure drift directly.
+  /// This flag records whether pre-sync storage status was successfully captured,
+  /// which helps correlate flash page timestamps with the device's uncorrected clock.
+  bool _preSyncStatusCaptured = false;
 
   static const int _buttonNotPressed = 0;
   static const int _buttonShortPress = 1;
@@ -79,7 +81,7 @@ class LimitlessDeviceConnection extends DeviceConnection {
       // Measure clock drift before syncing time. Query the device's current timestamp
       // so we can detect how far the pendant's internal clock has drifted during offline periods.
       // The Limitless pendant has no RTC, so its clock drifts when disconnected from the app.
-      await _detectClockDrift();
+      await _capturePreSyncState();
 
       // Command 1: Time sync — corrects the pendant's clock to match the host
       final timeSyncCmd = _encodeSetCurrentTime(DateTime.now().millisecondsSinceEpoch);
@@ -93,7 +95,7 @@ class LimitlessDeviceConnection extends DeviceConnection {
 
       _isInitialized = true;
       DebugLogManager.logInfo('Limitless device initialized successfully', {
-        'clockDriftMs': _clockDriftMs,
+        'preSyncStatusCaptured': _preSyncStatusCaptured,
       });
     } catch (e) {
       Logger.debug('Limitless: Initialization failed: $e');
@@ -102,10 +104,10 @@ class LimitlessDeviceConnection extends DeviceConnection {
     }
   }
 
-  /// Detect clock drift by querying device status before time sync.
-  /// The pendant's stored timestamps from offline recordings will reflect the drifted clock.
-  /// This drift value helps us understand if flash page timestamps are misaligned.
-  Future<void> _detectClockDrift() async {
+  /// Capture device storage status before time sync correction.
+  /// The pendant's stored timestamps from offline recordings reflect the drifted clock.
+  /// Logging pre-sync state helps correlate flash page timestamps with device state.
+  Future<void> _capturePreSyncState() async {
     try {
       _storageStateCompleter = Completer<Map<String, int>?>();
 
@@ -130,12 +132,12 @@ class LimitlessDeviceConnection extends DeviceConnection {
       // We can't directly read the device's internal clock, but we log the pre-sync
       // state so that flash page timestamps from batch downloads can be cross-referenced.
       // The drift will be observable when we compare flash page timestamps against wall clock.
-      _clockDriftMs = 0;
-      Logger.debug('Limitless: Pre-sync device status queried for drift detection');
+      _preSyncStatusCaptured = result != null;
+      Logger.debug('Limitless: Pre-sync device status queried (captured: $_preSyncStatusCaptured)');
     } catch (e) {
       Logger.debug('Limitless: Clock drift detection failed (non-fatal): $e');
       _storageStateCompleter = null;
-      _clockDriftMs = 0;
+      _preSyncStatusCaptured = false;
     }
   }
 
@@ -388,7 +390,7 @@ class LimitlessDeviceConnection extends DeviceConnection {
             'seq': seq,
             'flashPageDataSize': flashPageData.length,
             'firstBytes': firstBytes.toString(),
-            'clockDriftMs': _clockDriftMs,
+            'preSyncStatusCaptured': _preSyncStatusCaptured,
             'timestampMs': pageInfo['timestamp_ms'],
           });
         }
