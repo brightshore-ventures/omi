@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -445,7 +446,7 @@ class LocalWalSyncImpl implements LocalWalSync {
 
       listener.onWalUpdated();
       try {
-        var partialRes = await syncLocalFiles(files);
+        var partialRes = await _syncLocalFilesWithRetry(files);
 
         resp.newConversationIds
             .addAll(partialRes.newConversationIds.where((id) => !resp.newConversationIds.contains(id)));
@@ -574,5 +575,47 @@ class LocalWalSyncImpl implements LocalWalSync {
 
     progress?.onWalSyncedProgress(1.0);
     return resp;
+  }
+
+  /// Upload WAL files with exponential backoff + jitter on server errors.
+  /// Retries up to 3 times for 5xx "temporarily unavailable" errors.
+  /// Non-retryable errors (400, 413) are thrown immediately.
+  /// Successfully downloaded WAL files are preserved locally on failure,
+  /// so they won't need to be re-downloaded from the device on retry.
+  static Future<SyncLocalFilesResponse> _syncLocalFilesWithRetry(
+    List<File> files, {
+    int maxRetries = 3,
+  }) async {
+    final random = Random();
+    for (int attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await syncLocalFiles(files);
+      } catch (e) {
+        final isServerError = e.toString().contains('Server is temporarily unavailable');
+        final isRetryable = isServerError && attempt < maxRetries;
+
+        if (!isRetryable) {
+          rethrow;
+        }
+
+        // Exponential backoff: 2s, 4s, 8s with ±500ms jitter
+        final baseDelayMs = 2000 * (1 << attempt);
+        final jitterMs = random.nextInt(1000) - 500;
+        final delayMs = baseDelayMs + jitterMs;
+
+        Logger.debug('WAL upload retry ${attempt + 1}/$maxRetries after ${delayMs}ms (server unavailable)');
+        DebugLogManager.logWarning('WAL upload retry', {
+          'attempt': attempt + 1,
+          'maxRetries': maxRetries,
+          'delayMs': delayMs,
+          'filesCount': files.length,
+        });
+
+        await Future.delayed(Duration(milliseconds: delayMs));
+      }
+    }
+
+    // Should not reach here, but just in case
+    throw Exception('WAL upload failed after $maxRetries retries');
   }
 }
