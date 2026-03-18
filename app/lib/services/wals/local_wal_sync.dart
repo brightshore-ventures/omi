@@ -582,6 +582,8 @@ class LocalWalSyncImpl implements LocalWalSync {
   /// Non-retryable errors (400, 413) are thrown immediately.
   /// Successfully downloaded WAL files are preserved locally on failure,
   /// so they won't need to be re-downloaded from the device on retry.
+  // TODO: Replace string-based error detection with structured error types or
+  // HTTP status code checking for more robust retry classification.
   static Future<SyncLocalFilesResponse> _syncLocalFilesWithRetry(
     List<File> files, {
     int maxRetries = 3,
