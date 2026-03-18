@@ -107,6 +107,11 @@ class LimitlessDeviceConnection extends DeviceConnection {
   /// Capture device storage status before time sync correction.
   /// The pendant's stored timestamps from offline recordings reflect the drifted clock.
   /// Logging pre-sync state helps correlate flash page timestamps with device state.
+  ///
+  /// IMPORTANT: This method shares [_storageStateCompleter] and [_storageState] with
+  /// [getStorageStatus]. It is safe because this runs inside [_initialize] before
+  /// [_isInitialized] is set to true, and [getStorageStatus] returns null when
+  /// [_isInitialized] is false. Do not move this call outside of [_initialize].
   Future<void> _capturePreSyncState() async {
     try {
       _storageStateCompleter = Completer<Map<String, int>?>();
@@ -320,7 +325,8 @@ class LimitlessDeviceConnection extends DeviceConnection {
         // Sanity check: A valid flash page should contain ~4-8 Opus frames. If the
         // brute-force scanner finds fewer than 3 frames from a page with substantial
         // data, the matches are likely false positives from random byte patterns
-        // (probability ~0.17% per byte position). We discard low-count results to
+        // (low probability per position due to wire-type + length + TOC constraints).
+        // We discard low-count results to
         // avoid feeding garbage audio into the pipeline.
         if (opusFrames.isEmpty) {
           final bruteForceFrames = _bruteForceExtractOpusFrames(flashPageData);
