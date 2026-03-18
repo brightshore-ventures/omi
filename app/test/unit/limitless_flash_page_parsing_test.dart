@@ -5,6 +5,12 @@ import 'package:test/test.dart';
 /// These tests verify the fix for issues #5154 and #5733 where flash pages
 /// from sessions recorded during extended offline periods (clock drift)
 /// yield zero Opus frames despite containing valid data.
+///
+/// NOTE: The helper functions below (encodeVarint, decodeVarint, primaryParser,
+/// bruteForceExtractOpusFrames, etc.) mirror private methods in
+/// LimitlessDeviceConnection. They cannot be imported directly because they are
+/// private (_-prefixed). If the production parsers change, update these helpers
+/// to match.
 
 // Valid Opus TOC bytes used by the Limitless pendant
 const validOpusTocBytes = [0xb8, 0x78, 0xf8, 0xb0, 0x70, 0xf0];
@@ -397,7 +403,7 @@ void main() {
 
       final extracted = bruteForceExtractOpusFrames(data);
 
-      // With random data, false positives are possible (~0.17% per byte position)
+      // With random data, false positives are possible (low probability per position)
       // but should be very few. For a 4000-byte page, expect < 10 false positives.
       // The production code requires >= 3 frames to accept brute-force results,
       // so even if some false positives occur, the threshold filters them.
