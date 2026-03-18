@@ -18,6 +18,12 @@ class FlashPageWalSyncImpl implements FlashPageWalSync {
   static const int pagesPerChunk = 25;
   static const Duration _persistBatchDuration = Duration(seconds: 90);
 
+  /// Delay before mode switch to drain in-flight live audio packets (empirical).
+  static const Duration _preModeSwitchSettle = Duration(milliseconds: 200);
+
+  /// Delay after mode switch to prevent live/batch cross-contamination (empirical).
+  static const Duration _postModeSwitchSettle = Duration(milliseconds: 300);
+
   List<Wal> _wals = const [];
   BtDevice? _device;
   LocalWalSync? _localSync;
@@ -259,11 +265,9 @@ class FlashPageWalSyncImpl implements FlashPageWalSync {
       // enableBatchMode() already sends the mode switch command to the device,
       // but we add a brief delay to let any in-flight live audio packets drain.
       limitlessConnection.clearBuffer();
-      await Future.delayed(const Duration(milliseconds: 200));
+      await Future.delayed(_preModeSwitchSettle);
       await limitlessConnection.enableBatchMode();
-      // Additional settle time after mode switch to prevent cross-contamination
-      // of live audio data with batch flash page data
-      await Future.delayed(const Duration(milliseconds: 300));
+      await Future.delayed(_postModeSwitchSettle);
       Logger.debug("FlashPageSync: Batch mode enabled (with streaming guard)");
 
       _isSyncing = true;
