@@ -254,9 +254,19 @@ class FlashPageWalSyncImpl implements FlashPageWalSync {
       }
 
       final limitlessConnection = connection as LimitlessDeviceConnection;
+
+      // Guard: Ensure live audio streaming doesn't interfere with batch downloads.
+      // The Limitless pendant shares BLE characteristics between live and batch modes.
+      // Concurrent access can corrupt flash page data or cause frame misalignment.
+      // enableBatchMode() already sends the mode switch command to the device,
+      // but we add a brief delay to let any in-flight live audio packets drain.
       limitlessConnection.clearBuffer();
+      await Future.delayed(const Duration(milliseconds: 200));
       await limitlessConnection.enableBatchMode();
-      Logger.debug("FlashPageSync: Batch mode enabled");
+      // Additional settle time after mode switch to prevent cross-contamination
+      // of live audio data with batch flash page data
+      await Future.delayed(const Duration(milliseconds: 300));
+      Logger.debug("FlashPageSync: Batch mode enabled (with streaming guard)");
 
       _isSyncing = true;
       listener.onWalUpdated();

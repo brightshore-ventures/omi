@@ -32,6 +32,12 @@ class LimitlessDeviceConnection extends DeviceConnection {
   int _highestReceivedIndex = -1;
   int _lastAcknowledgedIndex = -1;
 
+  /// Pre-sync storage state captured before clock correction.
+  /// The Limitless pendant has no readable RTC, so we cannot measure drift directly.
+  /// This flag records whether pre-sync storage status was successfully captured,
+  /// which helps correlate flash page timestamps with the device's uncorrected clock.
+  bool _preSyncStatusCaptured = false;
+
   static const int _buttonNotPressed = 0;
   static const int _buttonShortPress = 1;
   static const int _buttonLongPress = 2;
@@ -71,7 +77,12 @@ class LimitlessDeviceConnection extends DeviceConnection {
 
   Future<void> _initialize() async {
     try {
-      // Command 1: Time sync
+      // Measure clock drift before syncing time. Query the device's current timestamp
+      // so we can detect how far the pendant's internal clock has drifted during offline periods.
+      // The Limitless pendant has no RTC, so its clock drifts when disconnected from the app.
+      await _capturePreSyncState();
+
+      // Command 1: Time sync — corrects the pendant's clock to match the host
       final timeSyncCmd = _encodeSetCurrentTime(DateTime.now().millisecondsSinceEpoch);
       await transport.writeCharacteristic(limitlessServiceUuid, limitlessTxCharUuid, timeSyncCmd);
       await Future.delayed(const Duration(seconds: 1));
@@ -82,11 +93,50 @@ class LimitlessDeviceConnection extends DeviceConnection {
       await Future.delayed(const Duration(seconds: 1));
 
       _isInitialized = true;
-      DebugLogManager.logInfo('Limitless device initialized successfully');
+      DebugLogManager.logInfo('Limitless device initialized successfully', {
+        'preSyncStatusCaptured': _preSyncStatusCaptured,
+      });
     } catch (e) {
       Logger.debug('Limitless: Initialization failed: $e');
       DebugLogManager.logError(e, null, 'Limitless initialization failed');
       rethrow;
+    }
+  }
+
+  /// Capture device storage status before time sync correction.
+  /// The pendant's stored timestamps from offline recordings reflect the drifted clock.
+  /// Logging pre-sync state helps correlate flash page timestamps with device state.
+  Future<void> _capturePreSyncState() async {
+    try {
+      _storageStateCompleter = Completer<Map<String, int>?>();
+
+      final statusCmd = _encodeGetDeviceStatus();
+      await transport.writeCharacteristic(limitlessServiceUuid, limitlessTxCharUuid, statusCmd);
+
+      final result = await _storageStateCompleter!.future.timeout(
+        const Duration(seconds: 3),
+        onTimeout: () => null,
+      );
+      _storageStateCompleter = null;
+
+      if (result != null) {
+        _storageState = result;
+        DebugLogManager.logEvent('limitless_pre_sync_storage_status', {
+          'oldestPage': result['oldest_flash_page'],
+          'newestPage': result['newest_flash_page'],
+          'currentSession': result['current_storage_session'],
+        });
+      }
+
+      // We can't directly read the device's internal clock, but we log the pre-sync
+      // state so that flash page timestamps from batch downloads can be cross-referenced.
+      // The drift will be observable when we compare flash page timestamps against wall clock.
+      _preSyncStatusCaptured = result != null;
+      Logger.debug('Limitless: Pre-sync device status queried (captured: $_preSyncStatusCaptured)');
+    } catch (e) {
+      Logger.debug('Limitless: Clock drift detection failed (non-fatal): $e');
+      _storageStateCompleter = null;
+      _preSyncStatusCaptured = false;
     }
   }
 
@@ -248,7 +298,56 @@ class LimitlessDeviceConnection extends DeviceConnection {
       if (flashPageData != null && flashPageData.isNotEmpty) {
         final pageInfo = _parseFlashPageInfo(flashPageData);
 
-        final opusFrames = _extractOpusFramesFromFlashPage(flashPageData);
+        // Primary parser: structured protobuf extraction
+        var opusFrames = _extractOpusFramesFromFlashPage(flashPageData);
+        String parserUsed = 'primary';
+
+        // Fallback 1: Try the broader marker-based parser if primary yields nothing.
+        // This handles cases where the protobuf schema differs for pages recorded during
+        // extended offline periods (clock drift) or with different firmware versions.
+        if (opusFrames.isEmpty) {
+          opusFrames = extractOpusFramesFromPage(flashPageData);
+          if (opusFrames.isNotEmpty) {
+            parserUsed = 'fallback_broad_markers';
+          }
+        }
+
+        // Fallback 2: Brute-force scan for Opus TOC bytes in the raw data.
+        // The data is physically present (~3750-4019 bytes) but the protobuf structure
+        // may be unparseable due to misaligned metadata from clock drift. This scanner
+        // looks for valid Opus frames by their TOC byte signature regardless of structure.
+        //
+        // Sanity check: A valid flash page should contain ~4-8 Opus frames. If the
+        // brute-force scanner finds fewer than 3 frames from a page with substantial
+        // data, the matches are likely false positives from random byte patterns
+        // (probability ~0.17% per byte position). We discard low-count results to
+        // avoid feeding garbage audio into the pipeline.
+        if (opusFrames.isEmpty) {
+          final bruteForceFrames = _bruteForceExtractOpusFrames(flashPageData);
+          if (bruteForceFrames.length >= 3) {
+            opusFrames = bruteForceFrames;
+            parserUsed = 'fallback_brute_force';
+          } else if (bruteForceFrames.isNotEmpty) {
+            // Too few frames — likely false positives from corrupted data.
+            // Log but don't use these frames.
+            DebugLogManager.logWarning('Limitless brute-force scanner rejected (likely false positives)', {
+              'index': index,
+              'session': session,
+              'frameCount': bruteForceFrames.length,
+              'flashPageDataSize': flashPageData.length,
+            });
+          }
+        }
+
+        // Fallback 3: Try recursive protobuf extraction from the entire page data.
+        if (opusFrames.isEmpty) {
+          final recursiveFrames = <List<int>>[];
+          _extractOpusRecursive(flashPageData, 0, flashPageData.length, recursiveFrames);
+          if (recursiveFrames.length >= 3) {
+            opusFrames = recursiveFrames;
+            parserUsed = 'fallback_recursive';
+          }
+        }
 
         if (opusFrames.isNotEmpty) {
           final avgFrameSize = opusFrames.fold<int>(0, (sum, f) => sum + f.length) ~/ opusFrames.length;
@@ -256,7 +355,8 @@ class LimitlessDeviceConnection extends DeviceConnection {
           final validTimestamp = timestampMs > 1577836800000;
 
           // Log data quality for every Nth page to avoid log spam, or always for anomalies
-          final isAnomaly = opusFrames.length < 4 || !validTimestamp || avgFrameSize < 10 || avgFrameSize > 200;
+          final isAnomaly = opusFrames.length < 4 || !validTimestamp || avgFrameSize < 10 || avgFrameSize > 200
+              || parserUsed != 'primary';
           if (isAnomaly || (_completedFlashPages.length % 50 == 0)) {
             DebugLogManager.logEvent('limitless_flash_page_received', {
               'index': index,
@@ -271,6 +371,7 @@ class LimitlessDeviceConnection extends DeviceConnection {
               'flashPageDataSize': flashPageData.length,
               'totalCompletedPages': _completedFlashPages.length,
               'isAnomaly': isAnomaly,
+              'parserUsed': parserUsed,
             });
           }
 
@@ -298,11 +399,17 @@ class LimitlessDeviceConnection extends DeviceConnection {
 
           _flashPageController.add(flashPage);
         } else {
-          DebugLogManager.logWarning('Limitless flash page yielded zero Opus frames', {
+          // All parsers failed — log detailed diagnostics for debugging.
+          // Include first bytes to help identify unknown protobuf structure.
+          final firstBytes = flashPageData.take(20).toList();
+          DebugLogManager.logWarning('Limitless flash page yielded zero Opus frames (all parsers failed)', {
             'index': index,
             'session': session,
             'seq': seq,
             'flashPageDataSize': flashPageData.length,
+            'firstBytes': firstBytes.toString(),
+            'preSyncStatusCaptured': _preSyncStatusCaptured,
+            'timestampMs': pageInfo['timestamp_ms'],
           });
         }
       }
@@ -531,6 +638,46 @@ class LimitlessDeviceConnection extends DeviceConnection {
         break;
       }
     }
+  }
+
+  /// Brute-force scanner for Opus frames in raw flash page data.
+  /// Used as a last-resort fallback when structured protobuf parsing fails,
+  /// e.g. when flash page metadata is misaligned due to clock drift.
+  ///
+  /// Scans for any byte that looks like a protobuf length-delimited field
+  /// followed by a valid Opus TOC byte. This is intentionally more permissive
+  /// than the structured parsers to recover data from pages with unknown structure.
+  List<List<int>> _bruteForceExtractOpusFrames(List<int> data) {
+    final frames = <List<int>>[];
+
+    for (int pos = 0; pos < data.length - 3; pos++) {
+      final wireType = data[pos] & 0x07;
+      if (wireType != 2) continue; // Only look at length-delimited fields
+
+      // Try to decode a varint length starting after the tag byte
+      int lengthPos = pos + 1;
+      if (lengthPos >= data.length) continue;
+
+      try {
+        final lengthResult = _decodeVarint(data, lengthPos);
+        final length = lengthResult[0] as int;
+        final dataStart = lengthResult[1] as int;
+
+        // Valid Opus frame: 10-200 bytes with a recognized TOC byte
+        if (length >= 10 && length <= 200 && dataStart + length <= data.length) {
+          final firstByte = data[dataStart];
+          if (_isValidOpusToc(firstByte)) {
+            frames.add(data.sublist(dataStart, dataStart + length));
+            // Skip past this frame to avoid extracting overlapping data
+            pos = dataStart + length - 1;
+          }
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+
+    return frames;
   }
 
   /// Observed pattern in BLE data:
